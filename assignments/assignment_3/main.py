@@ -1,77 +1,88 @@
-#%% IMPORTS
+#%%
 import pandas as pd
 import numpy as np
-import json
-import itertools
+
+from torch.utils.data import Dataset, DataLoader
+import torch
+import pytorch_lightning as pl
 
 import sklearn.preprocessing
 import sklearn.impute
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, precision_recall_curve
-
-import torch
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
-from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
-# from lightning.pytorch.callbacks import ModelCheckpoint
-
 
 ##### DATASET DEFINITION #####
-# https://www.kaggle.com/datasets/abhinav89/telecom-customer
-class CustomerChurn(Dataset):
+class PytorchData(Dataset):
     """Customer Churn Dataset."""
 
-    def __init__(self, data_file, dictionary_file, transform=None):
+    def __init__(self, data_file, transform=None):
         self.df = pd.read_csv(data_file)
-        with open(dictionary_file) as f: 
-            self.df_dict = json.load(f)
-
         self.__get_col_types__()
-        self.__transform_data__()
+        self.transform_data()
 
     
     def __get_col_types__(self):
         """Identifies Numerical, Categorical, and Target Columns"""
-        self.num_cols = []
-        self.cat_cols = []
-        self.emb_cols = []
-        self.targ = 'churn'
+        self.num_cols = ['LotFrontage', 'LotArea', 'OverallQual', 'OverallCond',
+                    'MasVnrArea', 'BsmtFinSF1',
+                    'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF', '1stFlrSF', 
+                    '2ndFlrSF', 'LowQualFinSF', 'GrLivArea', 'BsmtFullBath',
+                    'BsmtHalfBath', 'FullBath', 'HalfBath', 'BedroomAbvGr',
+                    'KitchenAbvGr', 'TotRmsAbvGrd', 'Fireplaces', 'GarageYrBlt',
+                    'GarageCars', 'GarageArea', 'WoodDeckSF', 'OpenPorchSF',
+                    'EnclosedPorch', '3SsnPorch', 'ScreenPorch', 'PoolArea',
+                    'MiscVal', 'MoSold', 'YrSold']
 
-        for col in self.df.columns:
-            type = self.df[col].dtype
-            uniques = self.df.value_counts(col).shape[0]
-            
-            # Custom Logic
-            if col == 'Customer_ID' or col == 'churn':
-                continue
+        self.cat_cols = ['MSZoning', 'Street', 'LotShape', 'LandContour', 
+                    'Utilities', 'LotConfig', 'LandSlope', 'Condition1',
+                    'Condition2', 'RoofStyle',
+                    'RoofMatl', 'MasVnrType', 'ExterQual', 'ExterCond',
+                    'Foundation', 'BsmtQual', 'BsmtCond', 'BsmtExposure',
+                    'BsmtFinType1', 'BsmtFinType2', 'Heating', 'HeatingQC',
+                    'CentralAir', 'Electrical', 'KitchenQual', 'Functional',
+                    'FireplaceQu', 'GarageType', 'GarageFinish', 'GarageQual', 
+                    'GarageCond', 'PavedDrive',  
+                    'SaleType',  'SaleCondition', 'Utilities',
+                    
+                    'MSSubClass', 'Neighborhood', 'Exterior1st', 'Exterior2nd']
+        self.emb_cols = ['MSSubClass', 'Neighborhood', 'Exterior1st', 'Exterior2nd']
 
-            # Other Cols
-            if type in ['float64', 'int64']:
-                self.num_cols.append(col)
-            elif type in ['object'] and uniques > 10:
-                self.emb_cols.append(col)
-            elif type in ['object'] and uniques <= 10:
-                self.cat_cols.append(col)
+        self.remove_cols = ['Id','PoolQC', 'MiscFeature', 'Alley', 'Fence']
+        self.targ_cols = ['HouseStyle', 'BldgType', 'YearBuilt', 'YearRemodAdd', 'SalePrice']
+        self.targ_cat = ['HouseStyle', 'BldgType']
+        self.targ_num = ['YearBuilt', 'YearRemodAdd', 'SalePrice']
 
-    def __transform_data__(self):
+
+    def transform_data(self):
+        # Input Data
         num_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='median')),
                              ('transform', sklearn.preprocessing.StandardScaler()),])
-        cat_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='most_frequent')),
+        cat_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='constant', 
+                                                                     fill_value='NA')),
                              ('transform', sklearn.preprocessing.OneHotEncoder(drop='first')),])
-        
-        ##### TODO: add entity embedding for emb_cols to reduce number of groups
+        self.tr_pipe = ColumnTransformer([("numerical", num_pipe, self.num_cols),
+                                          ("categorical", cat_pipe, self.cat_cols), ])
+        self.tr_pipe.fit(self.df)
+        df_x = self.tr_pipe.transform(self.df).toarray()
+        df_x = pd.DataFrame(df_x, columns=self.tr_pipe.get_feature_names_out())
+        self.df_x = df_x
 
+        # Output
+        self.targ_cat_pipe = Pipeline([('transform', sklearn.preprocessing.OneHotEncoder(drop='first'))])
+        self.targ_num_pipe = Pipeline([('scale', sklearn.preprocessing.StandardScaler())])
+        self.targ_cat_pipe.fit(self.df[self.targ_cat])
+        self.targ_num_pipe.fit(self.df[self.targ_num])
+        self.targ_pipe = ColumnTransformer([('target_cat', self.targ_cat_pipe, self.targ_cat),
+                                            ('target_num', self.targ_num_pipe, self.targ_num)])
+        df_y = self.targ_pipe.fit_transform(self.df).toarray()
+        df_y =  pd.DataFrame(df_y, columns=self.targ_pipe.get_feature_names_out())
+        self.df_y = df_y
 
-        tr_pipe = ColumnTransformer([ ("numerical", num_pipe, self.num_cols),
-                                      ("categorical", cat_pipe, self.cat_cols), ])
-        df_x = tr_pipe.fit_transform(self.df)
-        self.df_x = pd.DataFrame(df_x, columns=tr_pipe.get_feature_names_out())
+    def transform_back_targ(self, y):
+        cat_res = self.targ_cat_pipe.inverse_transform(y[:,:-3])
+        num_res = self.targ_num_pipe.inverse_transform(y[:,-3:])
+        targ = np.concatenate([cat_res, num_res], axis=1)
+        return(targ)
 
     def __len__(self):
         return self.df.shape[0]
@@ -80,173 +91,117 @@ class CustomerChurn(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        x_vals = self.df_x.iloc[idx, ]
-        y_vals = self.df[self.targ].iloc[idx, ]
+        x_vals = torch.tensor(self.df_x.iloc[idx, ], dtype=torch.float32)
+        y_vals = torch.tensor(self.df_y.iloc[idx, ], dtype=torch.float32)
 
-        x_tensor = torch.Tensor(x_vals.values)
-        y_tensor = torch.Tensor([y_vals]).T
+        return (x_vals, y_vals)
 
-        return (x_tensor, y_tensor)
-
-##### NEURAL NETWORK DEFINITION #####
+##### MODEL DEFINITION #####
 class DenseNN(pl.LightningModule):
-    def __init__(self, hd, ls, dr, af, opt):
+    def __init__(self):
         super().__init__()
-        encoder = nn.Sequential()
-        self.optimizer_type = opt
+        shared = torch.nn.Sequential()
+        regr = torch.nn.Sequential()
+        clasf = torch.nn.Sequential()
+        # self.optimizer_type = 
     
-        # Input Layer
-        encoder.append(nn.Linear(108, ls))
-        encoder.append(nn.Dropout(dr))
-        if af == 'ReLU': encoder.append(nn.ReLU())
-        elif af =='LeakyReLU': encoder.append(nn.LeakyReLU())
-        elif af =='ELU': encoder.append(nn.ELU())
-        elif af =='Tanh': encoder.append(nn.Tanh())
+        # Shared Layer
+        shared.append(torch.nn.Linear(248, 192))
+        shared.append(torch.nn.Dropout(0.7))
+        shared.append(torch.nn.ReLU())
+        
+        shared.append(torch.nn.Linear(192, 192))
+        shared.append(torch.nn.Dropout(0.7))
+        shared.append(torch.nn.ReLU())
 
         # Hidden Layers
-        for i in range(hd-1):  
-            encoder.append(nn.Linear(ls, ls))
-            encoder.append(nn.Dropout(dr))
-            if af == 'ReLU': encoder.append(nn.ReLU())
-            elif af =='LeakyReLU': encoder.append(nn.LeakyReLU())
-            elif af =='ELU': encoder.append(nn.ELU())
-            elif af =='Tanh': encoder.append(nn.Tanh())
+        # for i in range(hd-1):  
+        #     encoder.append(torch.nn.Linear(ls, ls))
+        #     encoder.append(torch.nn.Dropout(dr))
+        #     if af == 'ReLU': encoder.append(torch.nn.ReLU())
+        #     elif af =='LeakyReLU': encoder.append(torch.nn.LeakyReLU())
+        #     elif af =='ELU': encoder.append(torch.nn.ELU())
+        #     elif af =='Tanh': encoder.append(torch.nn.Tanh())
 
-        # Output Layers
-        encoder.append(nn.Linear(ls, 1))
-        encoder.append(nn.Dropout(dr))
-        encoder.append(nn.Sigmoid())
+        # Regression Output Layer
+        regr.append(torch.nn.Linear(192, 3))
+        
+        # Classification Output Layer
+        clasf.append(torch.nn.Linear(192, 11))
+        clasf.append(torch.nn.Sigmoid())
+        # shared.append(torch.nn.Dropout(dr))
 
-        self.encoder = encoder
+        self.shared = shared
+        self.regr = regr
+        self.clasf = clasf
 
     def forward(self, x):
-        embedding = self.encoder(x)
-        return embedding
+        shared_res = self.shared(x)
+        regr_res = self.regr(shared_res)
+        clasf_res = self.clasf(shared_res)
+        final_res = torch.cat([clasf_res, regr_res], 1)
+        return final_res
 
     def configure_optimizers(self):
-        if self.optimizer_type == 'Adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        elif self.optimizer_type == 'SGD':
-            optimizer = torch.optim.SGD(self.parameters(), lr=1e-3)
-        elif self.optimizer_type == 'LBFGS':
-            optimizer = torch.optim.LBFGS(self.parameters(), lr=1e-3)
+        # if self.optimizer_type == 'Adam':
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        # elif self.optimizer_type == 'SGD':
+        #     optimizer = torch.optim.SGD(self.parameters(), lr=1e-3)
+        # elif self.optimizer_type == 'LBFGS':
+        #     optimizer = torch.optim.LBFGS(self.parameters(), lr=1e-3)
         return optimizer
 
     def training_step(self, train_batch, batch_idx):
+        # Get Predictions
         x, y = train_batch
-        x = x.view(x.size(0), -1)
-        y_hat = self.encoder(x)    
-        loss = F.mse_loss(y_hat, y)
-        self.log('train_loss', loss, prog_bar=True)
-        return loss
+        res = self.forward(x)
 
-    def validation_step(self, val_batch, batch_idx):
-        x, y = val_batch
-        x = x.view(x.size(0), -1)
-        y_hat = self.encoder(x)
-        loss = F.mse_loss(y_hat, y)
-        self.log('val_loss', loss, prog_bar=True)
+        # Get Sale Price Prediction
+        sale_price = y[:,-1]
+        sale_price_pred = res[:,-1]
+        sale_price_loss = torch.nn.functional.mse_loss(sale_price_pred, sale_price)
+        self.log('regr_train_loss', sale_price_loss, prog_bar=True)
+
+        # sale_price_unscaled = data.transform_back_targ(y.cpu().detach().numpy())[:,-1].astype('float32')
+        # sale_price_pred_unscaled = data.transform_back_targ(res.cpu().detach().numpy())[:,-1].astype('float32')
+        # sale_price_loss_scaled = torch.nn.functional.mse_loss(torch.tensor(sale_price_pred_unscaled), 
+        #                                                       torch.tensor(sale_price_unscaled)) ** (1/2)
+        # self.log('regr_uscaled_train_loss', sale_price_loss_scaled)
+
+        # Get House Category Prediction
+        return sale_price_loss
+
+    def validation_step(self, valid_batch, batch_idx):
+        # Get Predictions
+        x, y = valid_batch
+        res = self.forward(x)
+
+        # Get Sale Price Prediction
+        sale_price = y[:,-1]
+        sale_price_pred = res[:,-1]
+        sale_price_loss = torch.nn.functional.mse_loss(sale_price_pred, sale_price)
+        self.log('regr_valid_loss', sale_price_loss, prog_bar=True)
+
+
+        # sale_price_unscaled = data.transform_back_targ(y.cpu().detach().numpy())[:,-1].astype('float32')
+        # sale_price_pred_unscaled = data.transform_back_targ(res.cpu().detach().numpy())[:,-1].astype('float32')
+        # sale_price_loss_scaled = torch.nn.functional.mse_loss(torch.tensor(sale_price_pred_unscaled), 
+        #                                                       torch.tensor(sale_price_unscaled)) ** (1/2)
+        # self.log('regr_unscaled_valid_loss', sale_price_loss_scaled)
+
+        # Get House Category Prediction
+        return sale_price_loss
+
 
 
 ##### DATA PREPARATION #####
-data = CustomerChurn('data.csv', 'data_dict.json')
-data_train, data_val, data_test = random_split(data, [40000, 10000, 50000])
-data_train = DataLoader(data_train, batch_size=500)
-data_val = DataLoader(data_val, batch_size=500)
-data_test = DataLoader(data_test, batch_size=500)
+data = PytorchData('data/train.csv')
+data_train, data_val = torch.utils.data.random_split(data, [1000, 460])
+data_train = DataLoader(data_train, batch_size=200)
+data_val = DataLoader(data_val, batch_size=200)
 
-
-#%%
 ##### BASELINE MODEL #####
-hl_def = 1
-ls_def = 256
-dr_def = 0.25
-act_def = 'ReLU'
-opt_def = 'Adam'
-
-logger = TensorBoardLogger('lightning_logs', name='baseline')
-model = DenseNN(hl_def, ls_def, dr_def, act_def, opt_def)
-trainer = pl.Trainer(max_epochs=50, logger=logger)
+model = DenseNN()
+trainer = pl.Trainer(max_epochs=1000)
 trainer.fit(model, data_train, data_val)
-
-#%%
-##### EXPERIMENTATION #####
-# Optimizers
-optimizers = ['Adam', 'SGD', 'LBFGS']
-for opt in optimizers:
-    if opt == opt_def: continue
-    logger = TensorBoardLogger('lightning_logs', name=f'opt_{opt}')
-    model = DenseNN(hl_def, ls_def, dr_def, act_def, opt)
-    trainer = pl.Trainer(max_epochs=50, logger=logger)
-    trainer.fit(model, data_train, data_val)
-
-#%%
-# Network Architecture (layer size)
-layer_sizes = [32, 64, 128, 256, 512]
-for ls in layer_sizes:
-    if ls == ls_def: continue
-    logger = TensorBoardLogger('lightning_logs', name=f'ls_{ls}')
-    model = DenseNN(hl_def, ls, dr_def, act_def, opt_def)
-    trainer = pl.Trainer(max_epochs=50, logger=logger)
-    trainer.fit(model, data_train, data_val)
-
-
-#%%
-# Network Architecture (hidden layers)
-hidden_layers = [1,2,3]
-for hl in hidden_layers:
-    if hl == hl_def: continue
-    logger = TensorBoardLogger('lightning_logs', name=f'hl_{hl}')
-    model = DenseNN(hl, ls_def, dr_def, act_def, opt_def)
-    trainer = pl.Trainer(max_epochs=50, logger=logger)
-    trainer.fit(model, data_train, data_val)
-
-
-#%%
-# Network Architecture (Dropout Rate)
-dropout_rates = np.linspace(0,0.9, 10)
-for dr in dropout_rates:
-    if dr == dr_def: continue
-    logger = TensorBoardLogger('lightning_logs', name=f'dr_{dr}')
-    model = DenseNN(hl_def, ls_def, dr, act_def, opt_def)
-    trainer = pl.Trainer(max_epochs=50, logger=logger)
-    trainer.fit(model, data_train, data_val)
-
-
-#%% 
-# Activation Functions
-activations = ['ReLU', 'LeakyReLU', 'ELU', 'Tanh']
-for act in activations:
-    if act == act_def: continue
-    logger = TensorBoardLogger('lightning_logs', name=f'act_{act}')
-    model = DenseNN(hl_def, ls_def, dr_def, act, opt_def)
-    trainer = pl.Trainer(max_epochs=50, logger=logger)
-    trainer.fit(model, data_train, data_val)
-
-
-
-#%% 
-##### FINAL MODEL #####
-mc = ModelCheckpoint( every_n_epochs=1, save_top_k = -1)
-logger = TensorBoardLogger('lightning_logs', name='final', )
-model = DenseNN(2, 64, 0.3, 'LeakyReLU', 'Adam')
-trainer = pl.Trainer(max_epochs=75, 
-                     logger=logger, 
-                     callbacks=[mc])
-trainer.fit(model, data_train, data_val)
-
-
-# %%
-y_data = []
-y_hat_data = []
-for i, (x, y) in enumerate(data_test):
-    preds = model.encoder(x.to('cuda'))
-    y_hat_numpy = preds.detach().cpu().numpy().flatten()
-    y_numpy = y.detach().cpu().numpy().flatten()
-
-    y_data.extend(y_numpy)
-    y_hat_data.extend(y_hat_numpy)
-
-y_data = np.array(y_data)
-y_hat_data = np.array(y_hat_data).round(0)
 # %%
