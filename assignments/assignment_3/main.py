@@ -13,6 +13,7 @@ from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_sc
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torch.utils.data import random_split
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
