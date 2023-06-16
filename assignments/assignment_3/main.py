@@ -1,10 +1,14 @@
 #%%
 import pandas as pd
 import numpy as np
+import os
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torch
 import pytorch_lightning as pl
+from ray.tune.integration.pytorch_lightning import TuneReportCallback
+from ray import tune, air
+from ray.tune.search.optuna import OptunaSearch
 
 import sklearn.preprocessing
 import sklearn.impute
@@ -12,14 +16,13 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 
 ##### DATASET DEFINITION #####
-class PytorchData(Dataset):
+class PytorchData(pl.LightningDataModule):
     """Customer Churn Dataset."""
 
-    def __init__(self, data_file, transform=None):
+    def __init__(self, data_file):
         self.df = pd.read_csv(data_file)
         self.__get_col_types__()
         self.transform_data()
-
     
     def __get_col_types__(self):
         """Identifies Numerical, Categorical, and Target Columns"""
@@ -32,7 +35,6 @@ class PytorchData(Dataset):
                     'GarageCars', 'GarageArea', 'WoodDeckSF', 'OpenPorchSF',
                     'EnclosedPorch', '3SsnPorch', 'ScreenPorch', 'PoolArea',
                     'MiscVal', 'MoSold', 'YrSold']
-
         self.cat_cols = ['MSZoning', 'Street', 'LotShape', 'LandContour', 
                     'Utilities', 'LotConfig', 'LandSlope', 'Condition1',
                     'Condition2', 'RoofStyle',
@@ -41,44 +43,56 @@ class PytorchData(Dataset):
                     'BsmtFinType1', 'BsmtFinType2', 'Heating', 'HeatingQC',
                     'CentralAir', 'Electrical', 'KitchenQual', 'Functional',
                     'FireplaceQu', 'GarageType', 'GarageFinish', 'GarageQual', 
-                    'GarageCond', 'PavedDrive',  
-                    'SaleType',  'SaleCondition', 'Utilities',
-                    
-                    'MSSubClass', 'Neighborhood', 'Exterior1st', 'Exterior2nd']
-        self.emb_cols = ['MSSubClass', 'Neighborhood', 'Exterior1st', 'Exterior2nd']
-
-        self.remove_cols = ['Id','PoolQC', 'MiscFeature', 'Alley', 'Fence']
+                    'GarageCond', 'PavedDrive', 'Fence', 'Alley',
+                    'SaleType',  'SaleCondition', 'Utilities', 'MiscFeature',
+                    'Neighborhood', 'Exterior1st', 'Exterior2nd']
+        self.remove_cols = ['Id', 'MSSubClass', 'PoolQC']
+        
         self.targ_cols = ['HouseStyle', 'BldgType', 'YearBuilt', 'YearRemodAdd', 'SalePrice']
         self.targ_cat = ['HouseStyle', 'BldgType']
         self.targ_num = ['YearBuilt', 'YearRemodAdd', 'SalePrice']
+
 
 
     def transform_data(self):
         # Input Data
         num_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='median')),
                              ('transform', sklearn.preprocessing.StandardScaler()),])
-        cat_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='constant', 
-                                                                     fill_value='NA')),
-                             ('transform', sklearn.preprocessing.OneHotEncoder(drop='first')),])
-        self.tr_pipe = ColumnTransformer([("numerical", num_pipe, self.num_cols),
+        cat_pipe = Pipeline([('impute', sklearn.impute.SimpleImputer(strategy='constant', fill_value='NA')),
+                             ('transform', sklearn.preprocessing.OneHotEncoder(drop='first')),]) 
+        self.tr_pipe = ColumnTransformer([("numerical", num_pipe, self.num_cols), 
                                           ("categorical", cat_pipe, self.cat_cols), ])
-        self.tr_pipe.fit(self.df)
-        df_x = self.tr_pipe.transform(self.df).toarray()
+        df_x = self.tr_pipe.fit_transform(self.df).toarray()
         df_x = pd.DataFrame(df_x, columns=self.tr_pipe.get_feature_names_out())
         self.df_x = df_x
 
-        # Output
-        self.targ_cat_pipe = Pipeline([('transform', sklearn.preprocessing.OneHotEncoder(drop='first'))])
-        self.targ_num_pipe = Pipeline([('scale', sklearn.preprocessing.StandardScaler())])
-        self.targ_cat_pipe.fit(self.df[self.targ_cat])
-        self.targ_num_pipe.fit(self.df[self.targ_num])
-        self.targ_pipe = ColumnTransformer([('target_cat', self.targ_cat_pipe, self.targ_cat),
-                                            ('target_num', self.targ_num_pipe, self.targ_num)])
-        df_y = self.targ_pipe.fit_transform(self.df).toarray()
-        df_y =  pd.DataFrame(df_y, columns=self.targ_pipe.get_feature_names_out())
-        self.df_y = df_y
+        # Sale Prices
+        self.spr_pipe = Pipeline([('scale', sklearn.preprocessing.StandardScaler())])
+        df_spr = self.spr_pipe.fit_transform(self.df[['SalePrice']])
+        self.df_spr = pd.DataFrame(df_spr, columns=self.spr_pipe.get_feature_names_out())
+
+        # Year Remodelled
+        self.yrm_pipe = Pipeline([('scale', sklearn.preprocessing.StandardScaler())])
+        df_yrm = self.yrm_pipe.fit_transform(self.df[['YearRemodAdd']])
+        self.df_yrm = pd.DataFrame(df_yrm, columns=self.yrm_pipe.get_feature_names_out())
+
+        # Year Build
+        self.ybl_pipe = Pipeline([('scale', sklearn.preprocessing.StandardScaler())])
+        df_ybl = self.ybl_pipe.fit_transform(self.df[['YearBuilt']])
+        self.df_ybl = pd.DataFrame(df_ybl, columns=self.ybl_pipe.get_feature_names_out())
+
+        # Building Type
+        self.btp_pipe = Pipeline([('scale', sklearn.preprocessing.OneHotEncoder(drop=None, sparse_output=False))])
+        df_btp = self.btp_pipe.fit_transform(self.df[['BldgType']])
+        self.df_btp = pd.DataFrame(df_btp, columns=self.btp_pipe.get_feature_names_out())
+
+        # House Style
+        self.hst_pipe = Pipeline([('scale', sklearn.preprocessing.OneHotEncoder(drop=None, sparse_output=False))])
+        df_hst = self.hst_pipe.fit_transform(self.df[['HouseStyle']])
+        self.df_hst = pd.DataFrame(df_hst, columns=self.hst_pipe.get_feature_names_out())
 
     def transform_back_targ(self, y):
+        y = y.cpu().detach().numpy()
         cat_res = self.targ_cat_pipe.inverse_transform(y[:,:-3])
         num_res = self.targ_num_pipe.inverse_transform(y[:,-3:])
         targ = np.concatenate([cat_res, num_res], axis=1)
@@ -92,116 +106,171 @@ class PytorchData(Dataset):
             idx = idx.tolist()
 
         x_vals = torch.tensor(self.df_x.iloc[idx, ], dtype=torch.float32)
-        y_vals = torch.tensor(self.df_y.iloc[idx, ], dtype=torch.float32)
+        spr_vals = torch.tensor(self.df_spr.iloc[idx, ], dtype=torch.float32)
+        yrm_vals = torch.tensor(self.df_yrm.iloc[idx, ], dtype=torch.float32)
+        ybl_vals = torch.tensor(self.df_ybl.iloc[idx, ], dtype=torch.float32)
+        btp_vals = torch.tensor(self.df_btp.iloc[idx, ], dtype=torch.float32)
+        hst_vals = torch.tensor(self.df_hst.iloc[idx, ], dtype=torch.float32)
 
-        return (x_vals, y_vals)
+        return (x_vals, spr_vals, yrm_vals, ybl_vals, btp_vals, hst_vals)
 
 ##### MODEL DEFINITION #####
 class DenseNN(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
+
+        # Config
+        self.hl = config['hl']
+        self.ls = config['hls']
+        self.do = config['dr']
+        self.on = config['opt']
+        self.lr = config['lr']
+        self.act = config['act']
+
         shared = torch.nn.Sequential()
-        regr = torch.nn.Sequential()
-        clasf = torch.nn.Sequential()
-        # self.optimizer_type = 
-    
-        # Shared Layer
-        shared.append(torch.nn.Linear(248, 192))
-        shared.append(torch.nn.Dropout(0.7))
-        shared.append(torch.nn.ReLU())
-        
-        shared.append(torch.nn.Linear(192, 192))
-        shared.append(torch.nn.Dropout(0.7))
-        shared.append(torch.nn.ReLU())
+        spr = torch.nn.Sequential()
+        yrm = torch.nn.Sequential()
+        ybl = torch.nn.Sequential()
+        btp = torch.nn.Sequential()
+        hst = torch.nn.Sequential()
+ 
+        # Input Layer
+        shared.append(torch.nn.Linear(244, self.ls))
+        shared.append(torch.nn.Dropout(self.do))
+        if self.act == 'ReLU': shared.append(torch.nn.ReLU())
+        if self.act == 'LRelu': shared.append(torch.nn.LeakyReLU())
+        if self.act == 'Tanh': shared.append(torch.nn.Tanh())
+
+        # shared.append(torch.nn.ReLU())
 
         # Hidden Layers
-        # for i in range(hd-1):  
-        #     encoder.append(torch.nn.Linear(ls, ls))
-        #     encoder.append(torch.nn.Dropout(dr))
-        #     if af == 'ReLU': encoder.append(torch.nn.ReLU())
-        #     elif af =='LeakyReLU': encoder.append(torch.nn.LeakyReLU())
-        #     elif af =='ELU': encoder.append(torch.nn.ELU())
-        #     elif af =='Tanh': encoder.append(torch.nn.Tanh())
+        for hl in range(self.hl-1):
+            shared.append(torch.nn.Linear(self.ls, self.ls))
+            shared.append(torch.nn.Dropout(self.do))
+            if self.act == 'ReLU': shared.append(torch.nn.ReLU())
+            if self.act == 'LRelu': shared.append(torch.nn.LeakyReLU())
+            if self.act == 'Tanh': shared.append(torch.nn.Tanh())
 
-        # Regression Output Layer
-        regr.append(torch.nn.Linear(192, 3))
-        
-        # Classification Output Layer
-        clasf.append(torch.nn.Linear(192, 11))
-        clasf.append(torch.nn.Sigmoid())
-        # shared.append(torch.nn.Dropout(dr))
+        # Multiple Output Layers
+        spr.append(torch.nn.Linear(self.ls, 1))
+        yrm.append(torch.nn.Linear(self.ls, 1))
+        ybl.append(torch.nn.Linear(self.ls, 1))
+
+        btp.append(torch.nn.Linear(self.ls, 5))
+        btp.append(torch.nn.Softmax())
+        hst.append(torch.nn.Linear(self.ls, 8))
+        hst.append(torch.nn.Softmax())
 
         self.shared = shared
-        self.regr = regr
-        self.clasf = clasf
+        self.spr = spr
+        self.yrm = yrm
+        self.ybl = ybl
+        self.btp = btp
+        self.hst = hst
 
     def forward(self, x):
         shared_res = self.shared(x)
-        regr_res = self.regr(shared_res)
-        clasf_res = self.clasf(shared_res)
-        final_res = torch.cat([clasf_res, regr_res], 1)
-        return final_res
+
+        sale_price = self.spr(shared_res)
+        year_remod = self.yrm(shared_res)
+        year_built = self.ybl(shared_res)
+        build_type = self.btp(shared_res)
+        house_style = self.hst(shared_res)
+        return sale_price, year_remod, year_built, build_type, house_style
 
     def configure_optimizers(self):
-        # if self.optimizer_type == 'Adam':
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        # elif self.optimizer_type == 'SGD':
-        #     optimizer = torch.optim.SGD(self.parameters(), lr=1e-3)
-        # elif self.optimizer_type == 'LBFGS':
-        #     optimizer = torch.optim.LBFGS(self.parameters(), lr=1e-3)
+        if self.on == 'Adam': optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        elif self.on == 'SGD': optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
+        elif self.on == 'LBFGS': optimizer = torch.optim.LBFGS(self.parameters(), lr=self.lr)
         return optimizer
 
     def training_step(self, train_batch, batch_idx):
-        # Get Predictions
-        x, y = train_batch
-        res = self.forward(x)
+        # Get Values and Predictions
+        x, sale_price, year_remod, year_built, build_type, house_style = train_batch
+        sale_price_pred, year_remod_pred, year_built_pred, build_type_pred, house_style_pred = self.forward(x)
 
-        # Get Sale Price Prediction
-        sale_price = y[:,-1]
-        sale_price_pred = res[:,-1]
+        # Get Loss
         sale_price_loss = torch.nn.functional.mse_loss(sale_price_pred, sale_price)
-        self.log('regr_train_loss', sale_price_loss, prog_bar=True)
+        year_remod_loss = torch.nn.functional.mse_loss(year_remod_pred, year_remod)
+        year_built_loss = torch.nn.functional.mse_loss(year_built_pred, year_built)
+        build_type_loss = torch.nn.functional.cross_entropy(build_type_pred, build_type)
+        house_style_loss = torch.nn.functional.cross_entropy(house_style_pred, house_style)
+        tot_loss = sale_price_loss + year_remod_loss + year_built_loss + build_type_loss + house_style_loss
 
-        # sale_price_unscaled = data.transform_back_targ(y.cpu().detach().numpy())[:,-1].astype('float32')
-        # sale_price_pred_unscaled = data.transform_back_targ(res.cpu().detach().numpy())[:,-1].astype('float32')
-        # sale_price_loss_scaled = torch.nn.functional.mse_loss(torch.tensor(sale_price_pred_unscaled), 
-        #                                                       torch.tensor(sale_price_unscaled)) ** (1/2)
-        # self.log('regr_uscaled_train_loss', sale_price_loss_scaled)
-
-        # Get House Category Prediction
-        return sale_price_loss
+        # Logging
+        self.log('SalePrice_train_mse', sale_price_loss)
+        self.log('YearRemod_train_mse', year_remod_loss)
+        self.log('YearBuilt_train_mse', year_built_loss)
+        self.log('BldgType_train_ce', build_type_loss)
+        self.log('HouseStyle_train_ce', house_style_loss)
+        self.log('Overall_train_', tot_loss)
+        return tot_loss
 
     def validation_step(self, valid_batch, batch_idx):
-        # Get Predictions
-        x, y = valid_batch
-        res = self.forward(x)
+        # Get Values and Predictions
+        x, sale_price, year_remod, year_built, build_type, house_style = valid_batch
+        sale_price_pred, year_remod_pred, year_built_pred, build_type_pred, house_style_pred = self.forward(x)
 
-        # Get Sale Price Prediction
-        sale_price = y[:,-1]
-        sale_price_pred = res[:,-1]
+        # Get Loss
         sale_price_loss = torch.nn.functional.mse_loss(sale_price_pred, sale_price)
-        self.log('regr_valid_loss', sale_price_loss, prog_bar=True)
+        year_remod_loss = torch.nn.functional.mse_loss(year_remod_pred, year_remod)
+        year_built_loss = torch.nn.functional.mse_loss(year_built_pred, year_built)
+        build_type_loss = torch.nn.functional.cross_entropy(build_type_pred, build_type)
+        house_style_loss = torch.nn.functional.cross_entropy(house_style_pred, house_style)
+        tot_loss = sale_price_loss + year_remod_loss + year_built_loss + build_type_loss + house_style_loss
+        
+        # Logging
+        self.log('SalePrice_val_mse', sale_price_loss,)
+        self.log('YearRemod_val_mse', year_remod_loss)
+        self.log('YearBuilt_val_mse', year_built_loss)
+        self.log('BldgType_val_ce', build_type_loss)
+        self.log('HouseStyle_val_ce', house_style_loss)
+        self.log('Overall_val_', tot_loss)
+        return tot_loss
 
+##### HYPERPARAMETER TUNING #####
+def hyperpar_tune(config, data_train):
+    model = DenseNN(config)
+    data_train = DataLoader(data_train, batch_size=config['bs'])
 
-        # sale_price_unscaled = data.transform_back_targ(y.cpu().detach().numpy())[:,-1].astype('float32')
-        # sale_price_pred_unscaled = data.transform_back_targ(res.cpu().detach().numpy())[:,-1].astype('float32')
-        # sale_price_loss_scaled = torch.nn.functional.mse_loss(torch.tensor(sale_price_pred_unscaled), 
-        #                                                       torch.tensor(sale_price_unscaled)) ** (1/2)
-        # self.log('regr_unscaled_valid_loss', sale_price_loss_scaled)
+    metrics = ['SalePrice_val_mse', 'YearRemod_val_mse', 
+               'YearBuilt_val_mse', 'BldgType_val_ce', 
+               'HouseStyle_val_ce', 'Overall_val_',
+               'SalePrice_train_mse', 'YearRemod_train_mse', 
+               'YearBuilt_train_mse', 'BldgType_train_ce', 
+               'HouseStyle_train_ce', 'Overall_train_',]
+    logger = pl.loggers.TensorBoardLogger(save_dir=ORIG_DIR, name='inner')
+    trainer = pl.Trainer(max_epochs=300, 
+                         enable_progress_bar=False,
+                         logger=logger,
+                         callbacks=[TuneReportCallback(metrics, on="validation_end")])
+    trainer.fit(model, data_train, data_val)
 
-        # Get House Category Prediction
-        return sale_price_loss
-
-
+#%%
+ORIG_DIR = "/Users/konstantin/Documents/Projects/McGill/McGill-MGSC-673-AI/assignments/assignment_3"
 
 ##### DATA PREPARATION #####
 data = PytorchData('data/train.csv')
-data_train, data_val = torch.utils.data.random_split(data, [1000, 460])
-data_train = DataLoader(data_train, batch_size=200)
-data_val = DataLoader(data_val, batch_size=200)
+data_train, data_val, data_test = torch.utils.data.random_split(data, [1000, 400, 60])
+data_val = DataLoader(data_val, batch_size=400)
+data_test = DataLoader(data_test, batch_size=60)
 
-##### BASELINE MODEL #####
-model = DenseNN()
-trainer = pl.Trainer(max_epochs=1000)
-trainer.fit(model, data_train, data_val)
-# %%
+##### HYPERPARAMETERS #####
+config = {"hl": tune.randint(1,4),
+          "hls": tune.randint(30, 500),
+          "dr": tune.loguniform(1e-4, 0.9),
+          'opt': tune.choice(['Adam', 'SGD' ,'LBFGS']),
+          "lr": tune.loguniform(1e-4, 1e-1),
+          'act': tune.choice(['ReLU', 'LRelu' ,'Tanh']),
+          "bs": tune.randint(10, 501),}
+algo = OptunaSearch()
+
+tuner = tune.Tuner(tune.with_parameters(hyperpar_tune, data_train = data_train,),
+                   param_space = config,
+                   run_config=air.RunConfig(local_dir=ORIG_DIR),
+                   tune_config=tune.TuneConfig(mode="min", 
+                                               metric='Overall_val_',
+                                               num_samples=100,
+                                               max_concurrent_trials=7,
+                                               search_alg=algo))
+tuner.fit()
